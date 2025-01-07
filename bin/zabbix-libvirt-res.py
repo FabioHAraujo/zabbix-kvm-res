@@ -1,4 +1,4 @@
-#!/bin/env python
+#!/opt/venvs/zabbix_env/bin/python3
 # -*- coding: utf-8 -*-
 
 from __future__ import print_function
@@ -106,6 +106,14 @@ def main():
             dom = Domain(args.domain,uri=args.uri)
             is_none(dom.conn,"Could not connect to KVM using '%s'." % args.uri, 2)
             r = dom.memory['current']
+        elif args.action == "memory_usage":
+            dom = Domain(args.domain, uri=args.uri)
+            is_none(dom.conn, "Could not connect to KVM using '%s'." % args.uri, 2)
+            r = dom.get_memory_usage()
+        elif args.action == "cpu_usage":
+            dom = Domain(args.domain, uri=args.uri)
+            is_none(dom.conn, "Could not connect to KVM using '%s'." % args.uri, 2)
+            r = dom.get_domain_cpu_usage()
         elif args.action == 'memory_max':
             dom = Domain(args.domain,uri=args.uri)
             is_none(dom.conn,"Could not connect to KVM using '%s'." % args.uri, 2)
@@ -113,16 +121,20 @@ def main():
         dom.disconnect()
 
     elif args.resource == "host":
+        host = Host(uri=args.uri)
+        is_none(host.conn, "Could not connect to KVM using '%s'." % args.uri, 2)
+
         if args.action == "version":
-            host = Host(uri=args.uri)
-            is_none(host.conn,"Could not connect to KVM using '%s'." % args.uri, 2)
             r = host.version
         elif args.action == "type":
-            host = Host(uri=args.uri)
-            is_none(host.conn,"Could not connect to KVM using '%s'." % args.uri, 2)
             r = host.type
+        elif args.action == "cpu_usage":
+            r = host.get_cpu_usage()
+        elif args.action == "memory_usage":
+            r = host.get_memory_usage()
+
         host.disconnect()
-  
+
     print(r)
 
 class Libvirt(object):
@@ -161,6 +173,96 @@ class Host(Libvirt):
         self.type = self.conn.getType()
         return None
 
+    def get_cpu_usage(self, interval=1):
+        """
+        Retorna o uso de CPU do host em porcentagem (0 a 100).
+        """
+        try:
+            # Coleta inicial de estatísticas de CPU
+            cpu_stats_1 = self.conn.getCPUStats(libvirt.VIR_NODE_CPU_STATS_ALL_CPUS, 0)
+            if not cpu_stats_1:
+                raise Exception("Failed to retrieve initial CPU stats")
+
+            total_time_1 = sum(cpu_stats_1.values())
+            idle_time_1 = cpu_stats_1.get('idle', 0)
+
+            import time
+            time.sleep(interval)  # Espera pelo intervalo definido
+
+            # Coleta final de estatísticas de CPU
+            cpu_stats_2 = self.conn.getCPUStats(libvirt.VIR_NODE_CPU_STATS_ALL_CPUS, 0)
+            if not cpu_stats_2:
+                raise Exception("Failed to retrieve final CPU stats")
+
+            total_time_2 = sum(cpu_stats_2.values())
+            idle_time_2 = cpu_stats_2.get('idle', 0)
+
+            # Calcula a diferença entre os tempos total e ocioso
+            total_diff = total_time_2 - total_time_1
+            idle_diff = idle_time_2 - idle_time_1
+
+            if total_diff == 0:
+                raise Exception("Total time difference is zero, unable to calculate CPU usage")
+
+            # Calcula o uso de CPU
+            cpu_usage = ((total_diff - idle_diff) / total_diff) * 100
+            return round(cpu_usage, 2)
+
+        except libvirt.libvirtError as e:
+            print(f"Failed to retrieve CPU stats: {e}", file=sys.stderr)
+            sys.exit(3)
+        except Exception as e:
+            print(f"Error calculating CPU usage: {e}", file=sys.stderr)
+            sys.exit(3)
+
+    def get_memory_usage(self):
+        """
+        Retorna o uso de memória do domínio ou do host em porcentagem (0 a 100) e em bytes.
+        """
+        try:
+            if hasattr(self, 'name') and self.name != 'n/a':  # Verifica se é um domínio
+                dom = self.conn.lookupByName(self.name)
+                if not dom:
+                    raise Exception(f"Domain {self.name} not found")
+
+                memory_stats = dom.memoryStats()
+                max_memory = dom.maxMemory() * 1024  # Convertendo para bytes
+                current_memory = memory_stats.get('rss', 0) * 1024  # Convertendo para bytes
+
+                if max_memory == 0:
+                    raise Exception("Max memory reported as zero, unable to calculate memory usage")
+
+                memory_usage_percent = (current_memory / max_memory) * 100
+
+                return {
+                    'total': max_memory,
+                    'used': current_memory,
+                    'free': max_memory - current_memory,
+                    'percent_used': round(memory_usage_percent, 2)
+                }
+            else:  # Calcula para o host
+                total_memory = self.conn.getInfo()[1] * 1024 * 1024  # Total em bytes
+                free_memory = self.conn.getFreeMemory()
+
+                if total_memory == 0:
+                    raise Exception("Total memory reported as zero, unable to calculate memory usage")
+
+                used_memory = total_memory - free_memory
+                memory_usage_percent = (used_memory / total_memory) * 100
+
+                return {
+                    'total': total_memory,
+                    'used': used_memory,
+                    'free': free_memory,
+                    'percent_used': round(memory_usage_percent, 2)
+                }
+        except libvirt.libvirtError as e:
+            print(f"Failed to retrieve memory stats: {e}", file=sys.stderr)
+            sys.exit(3)
+        except Exception as e:
+            print(f"Error calculating memory usage: {e}", file=sys.stderr)
+            sys.exit(3)
+
 class Domain(Libvirt):
     def __init__(self, domain=None, uri='qemu:///system'):
         self.name = domain
@@ -195,6 +297,73 @@ class Domain(Libvirt):
         
         self.domainlist.sort()
         return self.domainlist
+    
+    def get_domain_cpu_usage(self, interval=1):
+        """
+        Retorna o uso de CPU do domínio em porcentagem (0 a 100).
+        """
+        try:
+            # Coleta inicial de estatísticas de CPU
+            cpu_time_1 = self.domain.info()[4]  # Tempo total de CPU em nanossegundos
+            num_vcpus = self.domain.info()[3]  # Número de vCPUs alocadas ao domínio
+
+            if num_vcpus == 0:
+                raise Exception("No vCPUs allocated to the domain, unable to calculate CPU usage")
+
+            import time
+            time.sleep(interval)  # Espera pelo intervalo definido
+
+            # Coleta final de estatísticas de CPU
+            cpu_time_2 = self.domain.info()[4]
+
+            # Calcula o tempo total de CPU usado entre as coletas
+            cpu_time_diff = cpu_time_2 - cpu_time_1
+
+            # Calcula o uso de CPU em porcentagem
+            cpu_usage = (cpu_time_diff / (interval * num_vcpus * 1e9)) * 100
+
+            return round(cpu_usage, 2)
+
+        except libvirt.libvirtError as e:
+            print(f"Failed to retrieve CPU stats for domain {self.name}: {e}", file=sys.stderr)
+            sys.exit(3)
+        except Exception as e:
+            print(f"Error calculating CPU usage for domain {self.name}: {e}", file=sys.stderr)
+            sys.exit(3)
+            
+    def get_memory_usage(self):
+        """
+        Retorna o uso de memória do domínio em porcentagem (0 a 100).
+        """
+        try:
+            # Obtém as estatísticas de memória do domínio
+            memory_stats = self.domain.memoryStats()
+
+            # Memória configurada (total) para o domínio
+            actual_memory = memory_stats.get('actual', 0) * 1024  # Convertendo para bytes
+
+            # Memória diretamente utilizável
+            usable_memory = memory_stats.get('usable', 0) * 1024  # Convertendo para bytes
+
+            if actual_memory == 0:
+                raise Exception("Actual memory reported as zero, unable to calculate memory usage")
+
+            # Calcula a memória usada
+            used_memory = actual_memory - usable_memory
+
+            # Calcula o uso de memória em porcentagem
+            memory_usage_percent = (used_memory / actual_memory) * 100
+
+            return round(memory_usage_percent, 2)
+        except libvirt.libvirtError as e:
+            print(f"Failed to retrieve memory stats: {e}", file=sys.stderr)
+            sys.exit(3)
+        except Exception as e:
+            print(f"Error calculating memory usage: {e}", file=sys.stderr)
+            sys.exit(3)
+
+
+            
 
 class Net(Libvirt):
     def __init__(self, net=None, uri='qemu:///system'):
@@ -263,11 +432,11 @@ def list_to_zbx(data, label):
     return { 'data': [ { label: e } for e in data ] }
 
 def parse_args():
-    valid_resource_types = [ "pool", "net", "domain", "host" ]
-    pool_valid_actions = [ 'list', 'total', 'used', 'free', 'active', 'UUID', 'count_active', 'count_inactive' ]
-    net_valid_actions = [ 'list', 'active', 'UUID', 'count_active', 'count_inactive' ]
-    domain_valid_actions = [ 'list', 'active', 'UUID', 'vcpus_current', 'vcpus_max', 'memory_current', 'memory_max', 'count_active', 'count_inactive' ]
-    host_valid_actions = [ "version", "type" ]
+    valid_resource_types = ["pool", "net", "domain", "host"]
+    pool_valid_actions = ['list', 'total', 'used', 'free', 'active', 'UUID', 'count_active', 'count_inactive']
+    net_valid_actions = ['list', 'active', 'UUID', 'count_active', 'count_inactive']
+    domain_valid_actions = ['list', 'active', 'UUID', 'vcpus_current', 'vcpus_max', 'memory_current', 'memory_max', 'memory_usage', 'cpu_usage', 'count_active', 'count_inactive']
+    host_valid_actions = ["version", "type", "cpu_usage", "memory_usage"]
 
     parser = argparse.ArgumentParser(description='Return KVM information for Zabbix parsing')
     parser.add_argument('-U', '--uri', help="Connection URI", metavar='URI', type=str, default='qemu:///system')
